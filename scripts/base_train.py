@@ -88,6 +88,7 @@ parser.add_argument("--stochastic-raw-splits", action="store_true", help="allow 
 parser.add_argument("--data-seed", type=int, default=0, help="seed for epoch shuffles and StochasTok")
 parser.add_argument("--doc-log-dir", type=str, default="", help="write a per-rank SQLite log of every sampled document here")
 parser.add_argument("--byte-budget-mb", type=float, default=-1, help="override the byte budget in MB (default: sum over languages of tier pool x epochs)")
+parser.add_argument("--budget-log-every", type=int, default=100, help="log per-language byte-budget consumption and epochs every N steps (mixture mode)")
 parser.add_argument("--lang-eval-mb", type=float, default=-1, help="cap MB per language/split for per-language bpb eval (-1 = all)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
@@ -163,6 +164,13 @@ if use_mixture:
         infl = 1 + 0.85 * args.stochastic_p if (l in stochastic_langs and args.stochastic_p > 0) else 1.0
         est_tokens += e["tier_bytes"][str(tiers.get(l, 1))] * tiers.get(l, 1) * tpb * infl
     mixture_target_tokens = int(est_tokens * (byte_budget / total_budget_bytes(manifest, tiers)))
+    # per-language byte budget (what the run should consume) and the size of its repetition pool
+    lang_names = list(manifest["languages"])
+    _scale = byte_budget / total_budget_bytes(manifest, tiers)
+    lang_pool_bytes = {l: manifest["languages"][l]["tier_bytes"][str(tiers.get(l, 1))] for l in lang_names}
+    lang_target_bytes = {l: lang_pool_bytes[l] * tiers.get(l, 1) * _scale for l in lang_names}
+    print0("Per-language budget: " + " | ".join(
+        f"{l} E={tiers.get(l, 1)} pool {lang_pool_bytes[l]/1e6:,.1f} MB -> target {lang_target_bytes[l]/1e6:,.0f} MB" for l in lang_names))
     print0(f"Estimated total training tokens: {mixture_target_tokens:,}")
 else:
     byte_budget = None
@@ -377,7 +385,7 @@ dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_s
 doclog = None
 if use_mixture:
     if args.doc_log_dir:
-        doclog = DocLog(args.doc_log_dir, args.model_tag or f"d{args.depth}", ddp_rank)
+        doclog = DocLog(args.doc_log_dir, args.model_tag or f"d{args.depth}", ddp_rank, fresh=not resuming)
     train_loader = mixture_data_loader(
         tokenizer, manifest, tiers, args.device_batch_size, args.max_seq_len, device=device, seed=args.data_seed,
         stochastic_p=args.stochastic_p, stochastic_langs=stochastic_langs, stochastic_from_epoch=args.stochastic_from_epoch,
@@ -489,6 +497,20 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
+def budget_report(state):
+    """Per-language byte-budget consumption and epochs, summed over ranks. Every rank must call this."""
+    counts = torch.tensor([[state["bytes_consumed"][l], state["tokens_consumed"][l]] for l in lang_names], dtype=torch.float64, device=device)
+    if is_ddp_initialized():
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+    log, parts = {}, []
+    for l, (b, t) in zip(lang_names, counts.cpu().tolist()):
+        frac_l, epochs_l = b / lang_target_bytes[l], b / lang_pool_bytes[l]  # epochs = fractional passes over the tier pool
+        log.update({f"budget/{l}/bytes_mb": b / 1e6, f"budget/{l}/bytes_frac": frac_l, f"budget/{l}/epochs": epochs_l,
+                    f"budget/{l}/tokens": t, f"budget/{l}/tokens_per_byte": t / max(b, 1.0),
+                    f"budget/{l}/epoch_counter_rank0": state["epochs"][l]})
+        parts.append(f"{l[:3]} {100 * frac_l:5.1f}% ({epochs_l:.2f}/{tiers.get(l, 1)} ep, {t / 1e6:.0f}M tok)")
+    return log, "budget | " + " | ".join(parts)
 
 # Go!
 while True:
@@ -678,6 +700,11 @@ while True:
             log_data.update({f"train/tokens_rank0/{l}": n for l, n in dataloader_state_dict["tokens_consumed"].items()})
         wandb_run.log(log_data)
 
+    if use_mixture and step % args.budget_log_every == 0:
+        budget_log, budget_line = budget_report(dataloader_state_dict)
+        print0(f"step {step:05d} {budget_line}")
+        wandb_run.log({"step": step, **budget_log})
+
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
@@ -701,6 +728,10 @@ if val_bpb is not None:
 # cleanup
 if doclog is not None:
     doclog.close()
+if use_mixture:
+    budget_log, budget_line = budget_report(dataloader_state_dict)
+    print0(f"Final {budget_line}")
+    wandb_run.log({"step": step, **budget_log})
 if use_mixture and master_process:
     print0(f"Final: {step:,} steps, {byte_frac*100:.1f}% of byte budget, tokens (rank 0) per language: {dataloader_state_dict['tokens_consumed']}")
 wandb_run.finish() # wandb run finish

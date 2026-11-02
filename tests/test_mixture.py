@@ -101,6 +101,13 @@ def test_all(tok_path):
             expect = lang != "eng_Latn" and epoch >= 2
             assert bool(stoch) == expect, (lang, epoch, stoch)
         print("ok: stochastic policy (english canonical, epoch>=2 only)", rows[:6])
+        # a re-run of the same tag must start from an empty log; resuming keeps the rows
+        log2 = DocLog(db, "test", 0, fresh=False); log2.close()
+        n_keep = sqlite3.connect(os.path.join(db, "doclog_rank0.sqlite")).execute("SELECT COUNT(*) FROM doc_events").fetchone()[0]
+        log3 = DocLog(db, "test", 0); log3.close()
+        n_fresh = sqlite3.connect(os.path.join(db, "doclog_rank0.sqlite")).execute("SELECT COUNT(*) FROM doc_events").fetchone()[0]
+        assert n_keep > 0 and n_fresh == 0, (n_keep, n_fresh)
+        print("ok: doc log fresh start vs resume")
 
         # 5) StochasTok preserves text, adds tokens, and char-safe never cuts a character
         st_safe, st_raw = StochasTok(tok, char_safe=True), StochasTok(tok, char_safe=False)

@@ -22,10 +22,16 @@ CREATE INDEX IF NOT EXISTS idx_doc ON doc_events (doc_id);
 
 
 class DocLog:
-    def __init__(self, log_dir, run_id, rank, flush_every=20000):
+    def __init__(self, log_dir, run_id, rank, flush_every=20000, fresh=True):
+        """fresh=True starts an empty log (a re-run of the same tag must not append to the old run's rows);
+        pass fresh=False when resuming a run."""
         os.makedirs(log_dir, exist_ok=True)
         self.run_id, self.rank, self.flush_every = run_id, rank, flush_every
         self.path = os.path.join(log_dir, f"doclog_rank{rank}.sqlite")
+        if fresh:
+            for suffix in ("", "-wal", "-shm"):
+                if os.path.exists(self.path + suffix):
+                    os.remove(self.path + suffix)
         self.db = sqlite3.connect(self.path)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
