@@ -41,6 +41,8 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--wandb-project", type=str, default="nanochat", help="wandb project")
+parser.add_argument("--wandb-group", type=str, default="", help="wandb group (e.g. the experiment id)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -109,7 +111,7 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=args.wandb_project, name=args.run, group=args.wandb_group or None, config=user_config)
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -409,10 +411,10 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
-# In mixture mode the horizon is a fixed number of *bytes*: `frac` (bytes consumed / byte budget,
+# In mixture mode the horizon is a fixed number of *bytes*: `byte_frac` (bytes consumed / byte budget,
 # all-reduced so every rank agrees) drives warmdown, momentum and weight decay; the number of steps
 # then depends on how many tokens the arm produces per byte. `max_iterations` is only a safety stop.
-frac = 0.0
+byte_frac = 0.0
 max_iterations = int(1.3 * num_iterations) + 10
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
@@ -421,9 +423,9 @@ def get_lr_multiplier(it):
     if use_mixture:
         if it < warmup_iters:
             return (it + 1) / warmup_iters
-        if frac <= 1 - args.warmdown_ratio:
+        if byte_frac <= 1 - args.warmdown_ratio:
             return 1.0
-        progress = min(1.0, (1 - frac) / args.warmdown_ratio)
+        progress = min(1.0, (1 - byte_frac) / args.warmdown_ratio)
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     if it < warmup_iters:
@@ -440,15 +442,15 @@ def get_muon_momentum(it):
         if it < 400:
             f = it / 400
             return (1 - f) * 0.85 + f * 0.97
-        if frac >= 1 - args.warmdown_ratio:
-            progress = min(1.0, (frac - (1 - args.warmdown_ratio)) / args.warmdown_ratio)
+        if byte_frac >= 1 - args.warmdown_ratio:
+            progress = min(1.0, (byte_frac - (1 - args.warmdown_ratio)) / args.warmdown_ratio)
             return 0.97 * (1 - progress) + 0.90 * progress
         return 0.97
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     warmdown_start = num_iterations - warmdown_iters
     if it < 400:
-        frac = it / 400
-        return (1 - frac) * 0.85 + frac * 0.97
+        warm = it / 400
+        return (1 - warm) * 0.85 + warm * 0.97
     elif it >= warmdown_start:
         progress = (it - warmdown_start) / warmdown_iters
         return 0.97 * (1 - progress) + 0.90 * progress
@@ -458,7 +460,7 @@ def get_muon_momentum(it):
 # Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
 def get_weight_decay(it):
     if use_mixture:
-        return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * min(frac, 1.0)))
+        return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * min(byte_frac, 1.0)))
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
 # -----------------------------------------------------------------------------
@@ -490,7 +492,7 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Go!
 while True:
-    last_step = (frac >= 1.0 or step >= max_iterations) if use_mixture else (step == num_iterations) # loop runs one extra time so that we can eval/save at the end
+    last_step = (byte_frac >= 1.0 or step >= max_iterations) if use_mixture else (step == num_iterations) # loop runs one extra time so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
@@ -629,7 +631,7 @@ while True:
         bytes_t = torch.tensor(float(sum(dataloader_state_dict["bytes_consumed"].values())), device=device)
         if is_ddp_initialized():
             dist.all_reduce(bytes_t, op=dist.ReduceOp.SUM)
-        frac = bytes_t.item() / byte_budget
+        byte_frac = bytes_t.item() / byte_budget
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -639,7 +641,7 @@ while True:
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    pct_done = 100 * frac if use_mixture else 100 * step / num_iterations
+    pct_done = 100 * byte_frac if use_mixture else 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
@@ -672,7 +674,7 @@ while True:
             "train/epoch": epoch,
         }
         if use_mixture:
-            log_data["train/bytes_frac"] = frac
+            log_data["train/bytes_frac"] = byte_frac
             log_data.update({f"train/tokens_rank0/{l}": n for l, n in dataloader_state_dict["tokens_consumed"].items()})
         wandb_run.log(log_data)
 
@@ -700,6 +702,6 @@ if val_bpb is not None:
 if doclog is not None:
     doclog.close()
 if use_mixture and master_process:
-    print0(f"Final: {step:,} steps, {frac*100:.1f}% of byte budget, tokens (rank 0) per language: {dataloader_state_dict['tokens_consumed']}")
+    print0(f"Final: {step:,} steps, {byte_frac*100:.1f}% of byte budget, tokens (rank 0) per language: {dataloader_state_dict['tokens_consumed']}")
 wandb_run.finish() # wandb run finish
 compute_cleanup()
