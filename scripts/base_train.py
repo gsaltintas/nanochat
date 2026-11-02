@@ -75,6 +75,18 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+# Multilingual mixture with a fixed *data* (byte) budget (see nanochat/mixture_loader.py)
+parser.add_argument("--tokenizer-path", type=str, default="", help="HF tokenizer.json (dir or file); empty = nanochat's own tokenizer")
+parser.add_argument("--mixture-manifest", type=str, default="", help="manifest.json from build_mixture.py; enables the mixture dataloader")
+parser.add_argument("--tiers", type=str, default="", help="repetition tier per language, e.g. rus_Cyrl=1,vie_Latn=4 (default 1)")
+parser.add_argument("--stochastic-p", type=float, default=0.0, help="StochasTok expansion proportion (0 = canonical tokenization)")
+parser.add_argument("--stochastic-langs", type=str, default="", help="comma-separated languages that get stochastic tokenization (default: all but eng_Latn)")
+parser.add_argument("--stochastic-from-epoch", type=int, default=1, help="first epoch (per language) on which stochastic tokenization applies")
+parser.add_argument("--stochastic-raw-splits", action="store_true", help="allow splits that cut through a multi-byte character (default: character-safe only)")
+parser.add_argument("--data-seed", type=int, default=0, help="seed for epoch shuffles and StochasTok")
+parser.add_argument("--doc-log-dir", type=str, default="", help="write a per-rank SQLite log of every sampled document here")
+parser.add_argument("--byte-budget-mb", type=float, default=-1, help="override the byte budget in MB (default: sum over languages of tier pool x epochs)")
+parser.add_argument("--lang-eval-mb", type=float, default=-1, help="cap MB per language/split for per-language bpb eval (-1 = all)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -118,9 +130,41 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
+if args.tokenizer_path:
+    from nanochat.hf_tokenizer import HFTokenizer
+    tokenizer = HFTokenizer(args.tokenizer_path)
+    token_bytes = tokenizer.token_bytes(device=device)
+else:
+    tokenizer = get_tokenizer()
+    token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
+use_mixture = bool(args.mixture_manifest)
+if use_mixture:
+    assert args.tokenizer_path, "the mixture loader needs --tokenizer-path (HF tokenizer)"
+    # nothing in the mixture setup uses CORE or sampling (they need nanochat's own special tokens)
+    args.core_metric_every = -1
+    args.sample_every = -1
+    from nanochat.mixture_loader import mixture_data_loader, load_manifest, parse_tiers, total_budget_bytes
+    from nanochat.mixture_eval import LangEvaluator
+    from nanochat.doclog import DocLog
+    manifest = load_manifest(args.mixture_manifest)
+    tiers = parse_tiers(args.tiers)
+    stochastic_langs = set(args.stochastic_langs.split(",")) if args.stochastic_langs else {l for l in manifest["languages"] if l != "eng_Latn"}
+    byte_budget = int(args.byte_budget_mb * 1e6) if args.byte_budget_mb > 0 else total_budget_bytes(manifest, tiers)
+    print0(f"Mixture: tiers={tiers or 'all 1'} | stochastic p={args.stochastic_p} on {sorted(stochastic_langs) if args.stochastic_p > 0 else 'none'} | byte budget {byte_budget/1e6:,.0f} MB")
+    lang_evaluator = LangEvaluator(tokenizer, manifest, args.device_batch_size, args.max_seq_len, device, max_mb=None if args.lang_eval_mb < 0 else args.lang_eval_mb)
+    # Estimated token horizon (only for batch-size / weight-decay scaling and ETA): canonical tokens/byte per
+    # language from the held-out windows, inflated by ~0.85*p for stochastic languages (measured in the survey).
+    est_tokens = 0.0
+    for l, e in manifest["languages"].items():
+        tpb = lang_evaluator.windows[(l, "heldout")].numel() / max(1, e["heldout"]["bytes"])
+        infl = 1 + 0.85 * args.stochastic_p if (l in stochastic_langs and args.stochastic_p > 0) else 1.0
+        est_tokens += e["tier_bytes"][str(tiers.get(l, 1))] * tiers.get(l, 1) * tpb * infl
+    mixture_target_tokens = int(est_tokens * (byte_budget / total_budget_bytes(manifest, tiers)))
+    print0(f"Estimated total training tokens: {mixture_target_tokens:,}")
+else:
+    byte_budget = None
+    lang_evaluator = None
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -266,7 +310,7 @@ def get_scaling_params(m):
     scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
     return scaling_params
 num_scaling_params = get_scaling_params(model)
-target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
+target_tokens = mixture_target_tokens if use_mixture else int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
 d12_ref = build_model_meta(12) # creates the model on meta device
@@ -328,8 +372,17 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+doclog = None
+if use_mixture:
+    if args.doc_log_dir:
+        doclog = DocLog(args.doc_log_dir, args.model_tag or f"d{args.depth}", ddp_rank)
+    train_loader = mixture_data_loader(
+        tokenizer, manifest, tiers, args.device_batch_size, args.max_seq_len, device=device, seed=args.data_seed,
+        stochastic_p=args.stochastic_p, stochastic_langs=stochastic_langs, stochastic_from_epoch=args.stochastic_from_epoch,
+        char_safe=not args.stochastic_raw_splits, doclog=doclog, resume_state_dict=dataloader_resume_state_dict)
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -356,9 +409,22 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
+# In mixture mode the horizon is a fixed number of *bytes*: `frac` (bytes consumed / byte budget,
+# all-reduced so every rank agrees) drives warmdown, momentum and weight decay; the number of steps
+# then depends on how many tokens the arm produces per byte. `max_iterations` is only a safety stop.
+frac = 0.0
+max_iterations = int(1.3 * num_iterations) + 10
+
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps
+    if use_mixture:
+        if it < warmup_iters:
+            return (it + 1) / warmup_iters
+        if frac <= 1 - args.warmdown_ratio:
+            return 1.0
+        progress = min(1.0, (1 - frac) / args.warmdown_ratio)
+        return progress * 1.0 + (1 - progress) * args.final_lr_frac
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     if it < warmup_iters:
         return (it + 1) / warmup_iters
@@ -370,6 +436,14 @@ def get_lr_multiplier(it):
 
 # Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
+    if use_mixture:
+        if it < 400:
+            f = it / 400
+            return (1 - f) * 0.85 + f * 0.97
+        if frac >= 1 - args.warmdown_ratio:
+            progress = min(1.0, (frac - (1 - args.warmdown_ratio)) / args.warmdown_ratio)
+            return 0.97 * (1 - progress) + 0.90 * progress
+        return 0.97
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     warmdown_start = num_iterations - warmdown_iters
     if it < 400:
@@ -383,6 +457,8 @@ def get_muon_momentum(it):
 
 # Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
 def get_weight_decay(it):
+    if use_mixture:
+        return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * min(frac, 1.0)))
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
 # -----------------------------------------------------------------------------
@@ -414,16 +490,24 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Go!
 while True:
-    last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    last_step = (frac >= 1.0 or step >= max_iterations) if use_mixture else (step == num_iterations) # loop runs one extra time so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
-        val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        if use_mixture:
+            with disable_fp8(model):
+                lang_bpb = lang_evaluator.evaluate(model, token_bytes)
+            held = [v for k, v in lang_bpb.items() if k.startswith("heldout/")]
+            val_bpb = sum(held) / len(held)  # macro average over languages
+            print0(f"Step {step:05d} | " + " | ".join(f"{k}: {v:.4f}" for k, v in sorted(lang_bpb.items())))
+            wandb_run.log({"step": step, **{f"lang/{k}": v for k, v in lang_bpb.items()}})
+        else:
+            val_loader = build_val_loader()
+            eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+            with disable_fp8(model):
+                val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -475,6 +559,8 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        if doclog is not None:
+            doclog.flush()
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -539,6 +625,11 @@ while True:
         optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    if use_mixture:
+        bytes_t = torch.tensor(float(sum(dataloader_state_dict["bytes_consumed"].values())), device=device)
+        if is_ddp_initialized():
+            dist.all_reduce(bytes_t, op=dist.ReduceOp.SUM)
+        frac = bytes_t.item() / byte_budget
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -548,7 +639,7 @@ while True:
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    pct_done = 100 * step / num_iterations
+    pct_done = 100 * frac if use_mixture else 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
@@ -558,12 +649,15 @@ while True:
     steps_done = step - 10
     if steps_done > 0:
         avg_time_per_step = total_training_time / steps_done
-        remaining_steps = num_iterations - step
+        remaining_steps = max(0, num_iterations - step)
         eta_seconds = remaining_steps * avg_time_per_step
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    if use_mixture:
+        epoch = "epochs " + ",".join(f"{l[:3]}={e}" for l, e in dataloader_state_dict["epochs"].items())
+    else:
+        epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
@@ -577,6 +671,9 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if use_mixture:
+            log_data["train/bytes_frac"] = frac
+            log_data.update({f"train/tokens_rank0/{l}": n for l, n in dataloader_state_dict["tokens_consumed"].items()})
         wandb_run.log(log_data)
 
     # state update
@@ -600,5 +697,9 @@ if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
 # cleanup
+if doclog is not None:
+    doclog.close()
+if use_mixture and master_process:
+    print0(f"Final: {step:,} steps, {frac*100:.1f}% of byte budget, tokens (rank 0) per language: {dataloader_state_dict['tokens_consumed']}")
 wandb_run.finish() # wandb run finish
 compute_cleanup()

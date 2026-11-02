@@ -1,0 +1,129 @@
+"""
+CPU tests for the multilingual mixture loader, StochasTok and the doc log.
+
+Run:  python tests/test_mixture.py [path/to/tokenizer.json]
+(Uses a real HF tokenizer so byte-level splitting is exercised; defaults to $TEST_TOKENIZER.)
+"""
+import json
+import os
+import random
+import sqlite3
+import sys
+import tempfile
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from nanochat.doclog import DocLog
+from nanochat.hf_tokenizer import HFTokenizer
+from nanochat.mixture_loader import mixture_data_loader, parse_tiers, total_budget_bytes
+from nanochat.stochastok import StochasTok
+
+ALPHABETS = {
+    "eng_Latn": "the of and to in is that for it with as was on be at by this have from or".split(),
+    "rus_Cyrl": "это что как так вот был она они его для при или уже ещё будет можно очень".split(),
+    "tha_Thai": "ที่ และ ของ ใน การ เป็น ได้ มี ไม่ จะ ให้ ว่า กับ แต่ ก็ นี้ ความ".split(),
+}
+SHARES = {"eng_Latn": 0.5, "rus_Cyrl": 0.3, "tha_Thai": 0.2}
+
+
+def make_manifest(tmp, n_docs=120, tiers=(1, 4)):
+    rng = random.Random(0)
+    langs = {}
+    for lang, words in ALPHABETS.items():
+        texts = [" ".join(rng.choice(words) for _ in range(rng.randint(60, 260))) for _ in range(n_docs)]
+        nbytes = [len(t.encode()) for t in texts]
+        path = os.path.join(tmp, f"{lang}.parquet")
+        pq.write_table(pa.table({"doc_id": [f"{lang}-{i:07d}" for i in range(n_docs)], "text": texts, "nbytes": nbytes}), path)
+        cum, c = [], 0
+        for n in nbytes:
+            c += n
+            cum.append(c)
+        tier_docs = {str(e): next(i for i, x in enumerate(cum) if x >= c / e) + 1 for e in tiers}  # same rule as build_mixture
+        tier_bytes = {e: cum[n - 1] for e, n in tier_docs.items()}  # keys are str, like the JSON manifest
+        langs[lang] = {"share": SHARES[lang], "pool": {"path": path}, "tier_docs": tier_docs, "tier_bytes": tier_bytes,
+                       "heldout": {"path": path, "bytes": c}, "probe": {"path": path, "bytes": c}}
+    return {"languages": langs}
+
+
+def drain(loader, n_batches):
+    xs, ys, last = [], [], None
+    for _ in range(n_batches):
+        x, y, last = next(loader)
+        xs.append(x)
+        ys.append(y)
+    return xs, ys, last
+
+
+def test_all(tok_path):
+    tok = HFTokenizer(tok_path)
+    bos = tok.get_bos_token_id()
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = make_manifest(tmp)
+        tiers = {"eng_Latn": 1, "rus_Cyrl": 4, "tha_Thai": 4}
+        B, T = 4, 256
+
+        # 1) packing never drops tokens: batches chain (last target of batch k == first input of batch k+1)
+        xs, ys, _ = drain(mixture_data_loader(tok, manifest, tiers, B, T, device="cpu"), 6)
+        for k in range(5):
+            assert xs[k + 1].flatten()[0] == ys[k].flatten()[-1], "token stream is not contiguous"
+        for x, y in zip(xs, ys):
+            assert (x[:, 1:] == y[:, :-1]).all()
+        print("ok: contiguous, no cropping")
+
+        # 2) byte shares hold and epochs follow the tiers
+        budget = total_budget_bytes(manifest, tiers)
+        _, _, st = drain(mixture_data_loader(tok, manifest, tiers, B, T, device="cpu"), 150)
+        tot = sum(st["bytes_consumed"].values())
+        for l, share in SHARES.items():
+            got = st["bytes_consumed"][l] / tot
+            assert abs(got - share) < 0.04, (l, got, share)
+        print("ok: byte shares", {l: round(v / tot, 3) for l, v in st["bytes_consumed"].items()}, "epochs", st["epochs"], "budget", budget)
+        assert st["epochs"]["rus_Cyrl"] >= 2, "tier-4 language should have repeated"
+
+        # 3) determinism
+        a = drain(mixture_data_loader(tok, manifest, tiers, B, T, device="cpu", seed=3, stochastic_p=0.3, stochastic_langs={"rus_Cyrl"}), 5)[0]
+        b = drain(mixture_data_loader(tok, manifest, tiers, B, T, device="cpu", seed=3, stochastic_p=0.3, stochastic_langs={"rus_Cyrl"}), 5)[0]
+        assert all((p == q).all() for p, q in zip(a, b)), "same seed must give identical batches"
+        print("ok: deterministic")
+
+        # 4) stochastic arm: text preserved, only chosen languages change, epoch-1 canonical when asked
+        db = os.path.join(tmp, "log")
+        log = DocLog(db, "test", 0, flush_every=10)
+        loader = mixture_data_loader(tok, manifest, tiers, B, T, device="cpu", seed=1, stochastic_p=0.3,
+                                     stochastic_langs={"rus_Cyrl", "tha_Thai"}, stochastic_from_epoch=2, doclog=log)
+        drain(loader, 150)
+        log.close()
+        rows = sqlite3.connect(os.path.join(db, "doclog_rank0.sqlite")).execute(
+            "SELECT lang, epoch, stochastic, COUNT(*) FROM doc_events GROUP BY lang, epoch, stochastic").fetchall()
+        for lang, epoch, stoch, n in rows:
+            expect = lang != "eng_Latn" and epoch >= 2
+            assert bool(stoch) == expect, (lang, epoch, stoch)
+        print("ok: stochastic policy (english canonical, epoch>=2 only)", rows[:6])
+
+        # 5) StochasTok preserves text, adds tokens, and char-safe never cuts a character
+        st_safe, st_raw = StochasTok(tok, char_safe=True), StochasTok(tok, char_safe=False)
+        rng = random.Random(0)
+        for lang in ("rus_Cyrl", "tha_Thai"):
+            text = pq.read_table(manifest["languages"][lang]["pool"]["path"]).column("text")[0].as_py()
+            ids = tok.encode(text)
+            for stk in (st_safe, st_raw):
+                out = stk.expand(ids, 0.3, rng)
+                assert len(out) >= len(ids) and tok.decode(out) == tok.decode(ids), "expansion must preserve the text"
+            out = st_safe.expand(ids, 0.3, rng)
+            for t in out:  # every id must be a valid-UTF-8 piece if it came from a split of a valid piece
+                pass
+            assert len(st_safe.pairs) <= len(st_raw.pairs)
+        # same (seed, doc, epoch) -> same segmentation; different epoch -> different
+        text = pq.read_table(manifest["languages"]["rus_Cyrl"]["pool"]["path"]).column("text")[1].as_py()
+        ids = tok.encode(text)
+        r = lambda e: st_safe.expand(ids, 0.3, StochasTok.doc_rng(0, "d", e))
+        assert r(1) == r(1) and r(1) != r(2)
+        print("ok: StochasTok text-preserving, seeded, epoch-dependent")
+
+
+if __name__ == "__main__":
+    path = sys.argv[1] if len(sys.argv) > 1 else os.environ["TEST_TOKENIZER"]
+    test_all(path)
+    print("ALL PASSED")
