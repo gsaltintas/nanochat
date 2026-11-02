@@ -157,7 +157,7 @@ if use_mixture:
     # language from the held-out windows, inflated by ~0.85*p for stochastic languages (measured in the survey).
     est_tokens = 0.0
     for l, e in manifest["languages"].items():
-        tpb = lang_evaluator.windows[(l, "heldout")].numel() / max(1, e["heldout"]["bytes"])
+        tpb = lang_evaluator.tpb[(l, "heldout")]  # tokens per byte over the docs actually evaluated (independent of --lang-eval-mb)
         infl = 1 + 0.85 * args.stochastic_p if (l in stochastic_langs and args.stochastic_p > 0) else 1.0
         est_tokens += e["tier_bytes"][str(tiers.get(l, 1))] * tiers.get(l, 1) * tpb * infl
     mixture_target_tokens = int(est_tokens * (byte_budget / total_budget_bytes(manifest, tiers)))

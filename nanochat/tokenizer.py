@@ -28,7 +28,10 @@ SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| 
 # -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
 import pickle
-import rustbpe
+try:
+    import rustbpe  # only needed to *train* nanochat's own tokenizer; HF tokenizers don't need it
+except ImportError:
+    rustbpe = None
 import tiktoken
 
 class RustBPETokenizer:

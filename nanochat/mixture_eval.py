@@ -16,6 +16,7 @@ class LangEvaluator:
     def __init__(self, tokenizer, manifest, B, T, device, max_mb=None):
         self.B, self.T, self.device = B, T, device
         self.windows = {}  # (lang, split) -> LongTensor (n_windows, T+1)
+        self.tpb = {}      # (lang, split) -> canonical tokens per byte, over the docs actually used
         bos = tokenizer.get_bos_token_id()
         for lang, entry in manifest["languages"].items():
             for split in ("heldout", "probe"):
@@ -28,11 +29,12 @@ class LangEvaluator:
                             break
                         tot += nb
                         keep += 1
-                    texts = texts[:keep]
+                    texts, nbytes = texts[:keep], nbytes[:keep]
                 flat = []
                 for ids in tokenizer.encode(texts):
                     flat.append(bos)
                     flat.extend(ids)
+                self.tpb[(lang, split)] = len(flat) / max(1, sum(nbytes))
                 n = (len(flat) - 1) // T
                 flat = torch.tensor(flat[: n * T + 1], dtype=torch.long)
                 # overlapping-by-one windows: row i covers flat[i*T : i*T + T + 1]
