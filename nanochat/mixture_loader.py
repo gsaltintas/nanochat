@@ -66,6 +66,7 @@ class _Lang:
         return perm[self.rank::self.world]
 
     def draw(self):
+        pre = (self.epoch, self.pos, self.bytes_drawn)  # resume point if this doc is still pending at checkpoint time
         if self.pos >= len(self.order):
             self.epoch += 1
             self.pos = 0
@@ -73,7 +74,7 @@ class _Lang:
         i = int(self.order[self.pos])
         self.pos += 1
         self.bytes_drawn += self.nbytes[i]
-        return self.doc_ids[i], self.texts[i], self.nbytes[i], self.epoch
+        return self.doc_ids[i], self.texts[i], self.nbytes[i], self.epoch, pre
 
 
 def mixture_data_loader(
@@ -102,7 +103,11 @@ def mixture_data_loader(
     pending = deque()    # (start_idx, meta) of docs whose first token has not been consumed yet
     bytes_consumed = {n: 0 for n in langs}
     tokens_consumed = {n: 0 for n in langs}
-    batch_idx = resume_state_dict["batch_idx"] if resume_state_dict else 0
+    batch_idx = 0
+    if resume_state_dict:  # continue the counters; the next yielded batch gets the next index
+        bytes_consumed.update(resume_state_dict.get("bytes_consumed", {}))
+        tokens_consumed.update(resume_state_dict.get("tokens_consumed", {}))
+        batch_idx = resume_state_dict["batch_idx"] + 1
     use_cuda = device == "cuda"
 
     def refill():
@@ -110,11 +115,11 @@ def mixture_data_loader(
         picked = []
         for _ in range(chunk_docs):
             name = min(langs, key=lambda n: langs[n].bytes_drawn / langs[n].share)
-            doc_id, text, nbytes, epoch = langs[name].draw()
-            picked.append((name, doc_id, text, nbytes, epoch))
+            doc_id, text, nbytes, epoch, pre = langs[name].draw()
+            picked.append((name, doc_id, text, nbytes, epoch, pre))
         ids_list = tokenizer.encode([p[2] for p in picked])
         new = []
-        for (name, doc_id, _, nbytes, epoch), ids in zip(picked, ids_list):
+        for (name, doc_id, _, nbytes, epoch, pre), ids in zip(picked, ids_list):
             stochastic = st is not None and name in stochastic_langs and epoch >= stochastic_from_epoch
             if stochastic:
                 ids = st.expand(ids, stochastic_p, StochasTok.doc_rng(seed, doc_id, epoch))
@@ -122,7 +127,7 @@ def mixture_data_loader(
             arr[0] = bos
             arr[1:] = ids
             h = zlib.crc32(arr.tobytes())
-            pending.append((stream_end, (name, doc_id, epoch, nbytes, len(arr), stochastic, h)))
+            pending.append((stream_end, (name, doc_id, epoch, nbytes, len(arr), stochastic, h, pre)))
             stream_end += len(arr)
             new.append(arr)
         buf = np.concatenate([buf[head:]] + new)
@@ -138,18 +143,27 @@ def mixture_data_loader(
         head += B * T
         consumed_tokens += B * T
         while pending and pending[0][0] < consumed_tokens:  # first token of this doc is now consumed
-            _, (name, doc_id, epoch, nbytes, ntok, stochastic, h) = pending.popleft()
+            _, (name, doc_id, epoch, nbytes, ntok, stochastic, h, _pre) = pending.popleft()
             bytes_consumed[name] += nbytes
             tokens_consumed[name] += ntok
             if doclog is not None:
                 doclog.log(batch_idx, name, doc_id, epoch, nbytes, ntok, stochastic, h)
+        # Resume point per language: the state before its earliest still-pending doc (docs drawn into the buffer but not
+        # yet consumed are re-drawn after a restart, with the same seeded segmentation); a language with no pending doc
+        # resumes from its current state. Only the tail of the one doc straddling the checkpoint is lost.
+        resume_langs = {n: {"epoch": L.epoch, "pos": L.pos, "bytes_drawn": L.bytes_drawn} for n, L in langs.items()}
+        seen = set()
+        for _, meta in pending:
+            n = meta[0]
+            if n not in seen:
+                seen.add(n)
+                resume_langs[n] = {"epoch": meta[7][0], "pos": meta[7][1], "bytes_drawn": meta[7][2]}
         state = {
             "batch_idx": batch_idx,
             "bytes_consumed": dict(bytes_consumed),
             "tokens_consumed": dict(tokens_consumed),
             "epochs": {n: L.epoch for n, L in langs.items()},
-            # resume state is approximate: documents already drawn into the token buffer are skipped
-            "langs": {n: {"epoch": L.epoch, "pos": L.pos, "bytes_drawn": L.bytes_drawn} for n, L in langs.items()},
+            "langs": resume_langs,
         }
         batch_idx += 1
         yield x.to(device, non_blocking=use_cuda), y.to(device, non_blocking=use_cuda), state

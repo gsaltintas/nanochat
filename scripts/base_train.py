@@ -70,6 +70,10 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--auto-resume", action="store_true", help="on start, resume from the latest *complete* checkpoint in the checkpoint dir if there is one (for preemptible jobs that are restarted with the same command); also re-attaches to the same wandb run")
+parser.add_argument("--keep-checkpoints", type=int, default=1, help="after each complete checkpoint, delete older ones, keeping this many (0 = keep all)")
+parser.add_argument("--no-compile", action="store_true", help="skip torch.compile (debugging / CPU tests)")
+parser.add_argument("--debug-crash-at-step", type=int, default=-1, help="TEST ONLY: hard-exit at this step to simulate a preemption")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -112,7 +116,7 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=args.wandb_project, name=args.run, group=args.wandb_group or None, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=args.wandb_project, name=args.run, group=args.wandb_group or None, config=user_config, **({"id": args.run, "resume": "allow"} if args.auto_resume else {}))
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -213,6 +217,14 @@ model.init_weights() # 3) All tensors get initialized
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+if args.auto_resume and args.resume_from_step == -1:
+    from nanochat.autoresume import latest_complete_step
+    _found = latest_complete_step(checkpoint_dir)
+    if _found >= 0:
+        args.resume_from_step = _found
+        print0(f"Auto-resume: latest complete checkpoint is step {_found}")
+    else:
+        print0("Auto-resume: no complete checkpoint yet, starting from scratch")
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -302,7 +314,7 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+model = model if args.no_compile else torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -387,6 +399,11 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+if resuming and use_mixture:
+    from nanochat.autoresume import load_loader_state
+    _per_rank = load_loader_state(checkpoint_dir, args.resume_from_step, ddp_rank)  # each rank resumes its own shard of the stream
+    assert _per_rank is not None, f"missing loader state for rank {ddp_rank} at step {args.resume_from_step}"
+    dataloader_resume_state_dict = _per_rank
 doclog = None
 if use_mixture:
     if args.doc_log_dir:
@@ -398,6 +415,8 @@ if use_mixture:
 else:
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
     build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+if resuming and use_mixture and doclog is not None:
+    doclog.truncate_after(dataloader_resume_state_dict["batch_idx"] + 1)  # drop rows logged after the checkpoint (they will be re-logged)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -428,6 +447,12 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 # all-reduced so every rank agrees) drives warmdown, momentum and weight decay; the number of steps
 # then depends on how many tokens the arm produces per byte. `max_iterations` is only a safety stop.
 byte_frac = 0.0
+if resuming and use_mixture:  # schedules depend on progress, so restore it before the first step
+    _b = torch.tensor(float(sum(dataloader_resume_state_dict["bytes_consumed"].values())), device=device)
+    if is_ddp_initialized():
+        dist.all_reduce(_b, op=dist.ReduceOp.SUM)
+    byte_frac = _b.item() / byte_budget
+    print0(f"Resumed at step {args.resume_from_step}: {byte_frac*100:.1f}% of the byte budget already consumed")
 max_iterations = int(1.3 * num_iterations) + 10
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
@@ -612,6 +637,22 @@ while True:
             },
             rank=ddp_rank,
         )
+        from nanochat.autoresume import save_loader_state, mark_complete, prune
+        if use_mixture:
+            save_loader_state(checkpoint_dir, step, ddp_rank, dataloader_state_dict)
+        if is_ddp_initialized():
+            dist.barrier()  # every rank has finished writing before the step is declared usable
+        if master_process:
+            mark_complete(checkpoint_dir, step)
+            _removed = prune(checkpoint_dir, keep=args.keep_checkpoints)
+            if _removed:
+                print0(f"Checkpoint {step} complete; pruned {len(_removed)} files of older checkpoints")
+        if is_ddp_initialized():
+            dist.barrier()
+
+    if args.debug_crash_at_step > 0 and step == args.debug_crash_at_step and not last_step:
+        print0(f"DEBUG: simulating a preemption at step {step}")
+        os._exit(3)
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:

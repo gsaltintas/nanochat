@@ -15,6 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from nanochat.autoresume import latest_complete_step, mark_complete, prune, save_loader_state, load_loader_state
 from nanochat.doclog import DocLog
 from nanochat.hf_tokenizer import HFTokenizer
 from nanochat.mixture_loader import mixture_data_loader, parse_tiers, total_budget_bytes
@@ -130,7 +131,68 @@ def test_all(tok_path):
         print("ok: StochasTok text-preserving, seeded, epoch-dependent")
 
 
+
+def test_autoresume_files():
+    with tempfile.TemporaryDirectory() as d:
+        def touch(*names):
+            for n in names:
+                open(os.path.join(d, n), "w").write("x")
+        for step in (100, 200, 300):
+            touch(f"model_{step:06d}.pt", f"meta_{step:06d}.json", f"optim_{step:06d}_rank0.pt", f"optim_{step:06d}_rank1.pt")
+            save_loader_state(d, step, 0, {"batch_idx": step})
+        mark_complete(d, 100)
+        mark_complete(d, 200)  # 300 was being written when the pod was evicted: no marker
+        assert latest_complete_step(d) == 200, latest_complete_step(d)
+        removed = prune(d, keep=1)
+        left = sorted(os.listdir(d))
+        assert not any("000100" in f for f in left) and any("000200" in f for f in left) and any("000300" in f for f in left), left
+        assert load_loader_state(d, 200, 0) == {"batch_idx": 200} and load_loader_state(d, 200, 1) is None
+        assert latest_complete_step(tempfile.gettempdir() + "/nope") == -1
+        print("ok: autoresume bookkeeping (incomplete step ignored, old step pruned)", len(removed), "files removed")
+
+
+def test_resume(tok_path):
+    tok = HFTokenizer(tok_path)
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = make_manifest(tmp)
+        tiers = {"eng_Latn": 1, "rus_Cyrl": 4, "tha_Thai": 4}
+        B, T, k, m = 4, 256, 30, 40
+        kw = dict(seed=5, stochastic_p=0.3, stochastic_langs={"rus_Cyrl", "tha_Thai"}, device="cpu")
+
+        def events(dirname):
+            db = sqlite3.connect(os.path.join(tmp, dirname, "doclog_rank0.sqlite"))
+            return db.execute("SELECT batch_idx, lang, doc_id, epoch, n_bytes FROM doc_events").fetchall()
+
+        ref = DocLog(os.path.join(tmp, "ref"), "r", 0, flush_every=10)
+        drain(mixture_data_loader(tok, manifest, tiers, B, T, doclog=ref, **kw), k + m)
+        ref.close()
+        log1 = DocLog(os.path.join(tmp, "a"), "a", 0, flush_every=10)
+        _, _, st = drain(mixture_data_loader(tok, manifest, tiers, B, T, doclog=log1, **kw), k)
+        log1.close()
+        log2 = DocLog(os.path.join(tmp, "b"), "b", 0, flush_every=10)
+        first = next(iter([None]))
+        gen = mixture_data_loader(tok, manifest, tiers, B, T, doclog=log2, resume_state_dict=st, **kw)
+        _, _, st2 = drain(gen, m)
+        log2.close()
+
+        ref_ev, a_ev, b_ev = events("ref"), events("a"), events("b")
+        key = lambda e: (e[2], e[3])
+        U1 = {key(e) for e in ref_ev if e[0] < k}
+        S1, S2 = {key(e) for e in a_ev}, {key(e) for e in b_ev}
+        assert S1 == U1, "deterministic prefix"
+        assert not (S1 & S2), f"documents consumed twice across the restart: {sorted(S1 & S2)[:3]}"
+        U = {key(e) for e in ref_ev}
+        assert len(U - (S1 | S2)) <= 4 and len(S2 - U) <= 4, (len(U - (S1 | S2)), len(S2 - U))
+        for lang in ALPHABETS:  # counters restored exactly and keep growing
+            want = sum(e[4] for e in ref_ev if e[0] < k and e[1] == lang)
+            assert st["bytes_consumed"][lang] == want, (lang, st["bytes_consumed"][lang], want)
+            assert st2["bytes_consumed"][lang] >= st["bytes_consumed"][lang]
+        assert min(e[0] for e in b_ev) >= k and st2["batch_idx"] == k + m - 1
+        print("ok: resume -> no doc twice, counters exact, lost/extra docs vs uninterrupted:", len(U - (S1 | S2)), len(S2 - U))
+
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else os.environ["TEST_TOKENIZER"]
     test_all(path)
+    test_autoresume_files()
+    test_resume(path)
     print("ALL PASSED")
