@@ -158,12 +158,17 @@ if use_mixture:
     lang_evaluator = LangEvaluator(tokenizer, manifest, args.device_batch_size, args.max_seq_len, device, max_mb=None if args.lang_eval_mb < 0 else args.lang_eval_mb)
     # Estimated token horizon (only for batch-size / weight-decay scaling and ETA): canonical tokens/byte per
     # language from the held-out windows, inflated by ~0.85*p for stochastic languages (measured in the survey).
-    est_tokens = 0.0
+    est_tokens, est_tokens_canonical = 0.0, 0.0
     for l, e in manifest["languages"].items():
         tpb = lang_evaluator.tpb[(l, "heldout")]  # tokens per byte over the docs actually evaluated (independent of --lang-eval-mb)
+        base = e["tier_bytes"][str(tiers.get(l, 1))] * tiers.get(l, 1) * tpb
         infl = 1 + 0.85 * args.stochastic_p if (l in stochastic_langs and args.stochastic_p > 0) else 1.0
-        est_tokens += e["tier_bytes"][str(tiers.get(l, 1))] * tiers.get(l, 1) * tpb * infl
-    mixture_target_tokens = int(est_tokens * (byte_budget / total_budget_bytes(manifest, tiers)))
+        est_tokens_canonical += base
+        est_tokens += base * infl
+    _byte_scale = byte_budget / total_budget_bytes(manifest, tiers)
+    # Hyperparameter scaling (batch size, weight decay) must not depend on the arm, so it uses the *canonical* token
+    # estimate; otherwise stochastic arms (more tokens per byte) would get a smaller weight decay than canonical.
+    mixture_target_tokens = int(est_tokens_canonical * _byte_scale)
     # per-language byte budget (what the run should consume) and the size of its repetition pool
     lang_names = list(manifest["languages"])
     _scale = byte_budget / total_budget_bytes(manifest, tiers)
@@ -171,7 +176,7 @@ if use_mixture:
     lang_target_bytes = {l: lang_pool_bytes[l] * tiers.get(l, 1) * _scale for l in lang_names}
     print0("Per-language budget: " + " | ".join(
         f"{l} E={tiers.get(l, 1)} pool {lang_pool_bytes[l]/1e6:,.1f} MB -> target {lang_target_bytes[l]/1e6:,.0f} MB" for l in lang_names))
-    print0(f"Estimated total training tokens: {mixture_target_tokens:,}")
+    print0(f"Estimated total training tokens: canonical {mixture_target_tokens:,} | this arm ~{int(est_tokens * _byte_scale):,} (hyperparameters scale with the canonical figure)")
 else:
     byte_budget = None
     lang_evaluator = None
