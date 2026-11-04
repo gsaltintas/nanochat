@@ -90,6 +90,7 @@ parser.add_argument("--stochastic-langs", type=str, default="", help="comma-sepa
 parser.add_argument("--stochastic-from-epoch", type=int, default=1, help="first epoch (per language) on which stochastic tokenization applies")
 parser.add_argument("--stochastic-raw-splits", action="store_true", help="allow splits that cut through a multi-byte character (default: character-safe only)")
 parser.add_argument("--data-seed", type=int, default=0, help="seed for epoch shuffles and StochasTok")
+parser.add_argument("--init-seed", type=int, default=42, help="seed for model initialization (compute_init always used 42; the launchers pass 42 + seed)")
 parser.add_argument("--doc-log-dir", type=str, default="", help="write a per-rank SQLite log of every sampled document here")
 parser.add_argument("--byte-budget-mb", type=float, default=-1, help="override the byte budget in MB (default: sum over languages of tier pool x epochs)")
 parser.add_argument("--budget-log-every", type=int, default=100, help="log per-language byte-budget consumption and epochs every N steps (mixture mode)")
@@ -188,6 +189,9 @@ print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
+torch.manual_seed(args.init_seed)  # compute_init seeded with 42; re-seed so that different runs can have different initializations
+if device_type == "cuda":
+    torch.cuda.manual_seed(args.init_seed)
 
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
